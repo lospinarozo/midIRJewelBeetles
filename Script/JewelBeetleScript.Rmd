@@ -1,0 +1,1367 @@
+---
+title: "JewelBeetlesMidIRScript1"
+output: html_document
+date: "2024-04-18"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Libraries
+
+```{r}
+install.packages("pavo")
+install.packages("ggplot2")
+install.packages("dplyr")
+install.packages("tidyr")
+install.packages("dplyr")
+install.packages("stringr")
+install.packages("DescTools")
+install.packages("ggrepel")
+install.packages("ggExtra")
+
+```
+
+
+```{r}
+library(pavo)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(DescTools)
+library(ggrepel)
+library(ggExtra)
+```
+
+# Functions
+
+## Import data
+
+The following function imports the model data directly from the folder path. Each folder corresponds to one of the experiments detailed above.
+
+```{r}
+import_dpt_files <- function(directory) {
+  # Get a list of all files in the directory
+  all_files <- list.files(directory, full.names = TRUE)
+  
+  # Filter files based on the .dpt extension
+  file_list <- all_files[grepl("\\.dpt$", all_files)]
+  
+  # Initialize an empty list to store data frames
+  data_list <- list()
+  
+  # Loop through each file, read it, add column names, and append to data_list
+  for (file in file_list) {
+    data <- read.table(file, header = FALSE, sep = "\t")  # No header
+    colnames(data) <- c("wavenumber", "percent")  # Add column names
+    # Add a new column with the file name
+    data$filename <- basename(file)
+    data_list[[length(data_list) + 1]] <- data
+  }
+  
+  # Ensure all data frames have the same column names
+  consistent_data <- lapply(data_list, function(df) {
+    colnames(df) <- c("wavenumber", "percent", "filename")  # Reassign col names 
+    return(df)
+  })
+  
+  # Combine all data frames in data_list into one master data frame
+  master_df <- do.call(rbind, consistent_data)
+  
+  # Optional: You may want to reset row names if needed
+  rownames(master_df) <- NULL
+  
+  return(master_df)
+}
+
+```
+
+
+## Fix file names
+
+Use this function only if file names need to be fixed. I used to unify the transmittance measurements
+
+
+```{r eval=FALSE}
+add_suffix_to_filenames <- function(directory, old_string, new_string) {
+  # Get a list of all files in the directory
+  all_files <- list.files(directory, full.names = TRUE)
+  
+  # Loop through each file and rename it by substituting the old_string with new_string
+  for (file in all_files) {
+    # Get the file name without the path
+    filename <- basename(file)
+    
+    # Check if the old_string is in the filename
+    if (grepl(old_string, filename)) {
+      # Replace old_string with new_string in the filename
+      new_filename <- gsub(old_string, new_string, filename)
+      
+      # Construct the new full file path
+      new_filepath <- file.path(directory, new_filename)
+      
+      # Rename the file
+      file.rename(file, new_filepath)
+    }
+  }
+}
+
+# Usage example
+directory <- "Data/midIR/mirIRTransmittanceMicroscope"
+old_string <- ""
+new_string <- ""
+add_suffix_to_filenames(directory, old_string, new_string)
+
+```
+
+
+## Smooth curves
+
+This function is needed because the analysis requires the multiplication fo two curves that do not vary in intervals of the same size. 
+
+```{r}
+
+# Function to smooth curves with specified wavelength range and interval size
+smooth_curve <- function(data, interval_size, min_wavelength, max_wavelength) {
+  # Extract wavelength and radiance from the data frame
+  wavelength <- data[[1]]
+  radiance <- data[[2]]
+  
+  # Generate a sequence of evenly spaced wavelengths within the specified range
+  new_wavelength <- seq(min_wavelength, max_wavelength, by = interval_size)
+  
+  # Interpolate the radiance values at the new wavelengths using spline
+  spline_fit <- spline(wavelength, radiance, xout = new_wavelength)
+  new_radiance <- round(spline_fit$y, 4)  # Round to 4 decimal places
+  
+  # Return a data frame with the smoothed wavelength and radiance
+  data.frame(wavelength = new_wavelength, radiance = new_radiance)
+}
+
+# Main function to apply smoothing to each radiance column
+smooth_all_curves <- function(data, interval_size, 
+                              min_wavelength, max_wavelength) {
+  # Extract wavelength column
+  wavelength <- data[[1]]
+  
+  # Initialize a new data frame with the new wavelengths
+  new_wavelength <- seq(min_wavelength, max_wavelength, by = interval_size)
+  smoothed_data <- data.frame(wavelength = new_wavelength)
+  
+  # Loop through each radiance column and apply the smoothing function
+  for (col in names(data)[-1]) {
+    radiance <- data[[col]]
+    smoothed_result <- smooth_curve(data.frame(wavelength, radiance), 
+                                    interval_size, 
+                                    min_wavelength, max_wavelength)
+    smoothed_data[[col]] <- round(smoothed_result$radiance, 4)# 4 decimal places
+  }
+  
+  return(smoothed_data)
+}
+
+```
+
+## Weighted measurements
+
+Use this function to find the multiplication between any experimental measurement and a given black body radiation data. It assumes that the black body radiation is in a data frame with wavelength in the first column and radiation in the second column. It also assumes that the in the sample data frame, the first column is the wavelength and each fo the columns from 2 onward are different species. Finally, it requires that both data frames have the same number of rows, which is achieved with the previous smoothing functions. 
+
+```{r}
+# Define the function to calculate the product of radiance and transmittance
+multiply_sample_bb <- function(radiance_df, transmittance_df) {
+  # Extract the radiance column
+  radiance <- radiance_df[, 2]
+  
+  # Initialize an empty data frame to store the results
+  Result <- data.frame(wavelength = transmittance_df[, 1])
+  
+  # Loop through each transmittance column (> 2nd column)
+  for (i in 2:ncol(transmittance_df)) {
+    # Multiply radiance with the current transmittance column
+    product <- radiance * transmittance_df[, i]
+    
+    # Add the result as a new column in the results data frame
+    # Use the name of the current transmittance column
+    Result[[names(transmittance_df)[i]]] <- product
+  }
+  
+  # Return the resulting data frame
+  return(Result)
+}
+
+```
+
+## Area under the curve
+
+This function is used to calculate the are under the curve of a weighted measurement, i.e. reflectance or transmittance that has been multiplied by the black body radiation.
+
+```{r}
+
+# using the AUC function from DescTools
+calculate_auc <- function(df) {
+  # Extract the wavelength column
+  wavelength <- df[, 1]
+  
+  # Initialize a named vector to store the AUC for each species
+  auc_values <- numeric(ncol(df) - 1)
+  names(auc_values) <- names(df)[-1]
+  
+  # Loop through each species column (2 onwards)
+  for (i in 2:ncol(df)) {
+    # Extract the current species column
+    weighteddata <- df[, i]
+    
+    # Calculate the area under the curve using the AUC function
+    auc_value <- AUC(wavelength, weighteddata)
+    
+    # Store the AUC value in the auc_values vector
+    auc_values[i - 1] <- auc_value
+  }
+  
+  # Return the auc_values vector
+  return(auc_values)
+}
+
+```
+
+# Raw data
+
+## ViS-NIR
+
+### Hemispherical reflectance
+
+```{r}
+Jdat0 <-  read.csv("Data/VIS_NIR/JewelHemisphericalRefCompiled.csv")
+
+# Filter out the raw current values
+Jdat <- Jdat0 %>% 
+  select(ends_with("_cal"))# keep only calibrated values 
+  
+names(Jdat) <- substr(names(Jdat),5,31)
+  
+Jdat$wl <- Jdat0$wl1 # add wavelentgh column
+
+JdatR <- Jdat %>% 
+  select(sort(names(.))) %>% 
+  select(wl,everything()) %>%
+  gather(key= "sample" , value= "reflectance", -wl) %>% 
+  mutate("treat" = substr(sample, 1,21)) %>% 
+  group_by(treat,wl) %>% 
+  summarise("avReflect" =  mean(reflectance),
+            "sdreflect" = sd(reflectance)) %>% 
+  mutate("spot" = substr(treat, 9,21),
+         "spp" =  substr(treat,1,7))
+
+
+head(JdatR)
+
+```
+
+General plot: 
+
+```{r}
+ggplot(JdatR, aes(x=wl,y=avReflect,color=spot)) +
+  geom_line()+
+  xlim(420,1100)+
+  ylim(0,60)+
+  ylab("Reflectance (%)")+
+  xlab("Wavelength (nm)")+
+  facet_wrap(~spp)+
+  theme_bw()
+
+```
+
+
+### Transmittance
+
+```{r}
+Jdat0.1 <-  read.csv("Data/VIS_NIR/JewelTransmittanceCompiled.csv")
+
+# Filter out the raw current values
+Jdat1 <- Jdat0.1 %>% 
+  select_if(~sum(!is.na(.)) > 0) %>% 
+  select(ends_with("_cal"))# keep only calibrated values 
+  
+names(Jdat1) <- substr(names(Jdat1),5,34)
+  
+Jdat1$wl <- Jdat0.1$wl1 # add wavelentgh column
+
+JdatT <- Jdat1 %>% 
+  select(sort(names(.))) %>% 
+  select(wl,everything()) %>%
+  gather(key= "sample" , value= "transmittance", -wl) %>% 
+  mutate("spot" = substr(sample, 9,21),
+         "spp" =  substr(sample,1,7)
+         ) %>% 
+  group_by(spp,spot,wl) %>% 
+  summarise("avTrans" =  mean(transmittance),
+            "sdTrans" = sd(transmittance)) 
+
+
+head(JdatT)
+
+```
+
+General plot: 
+
+```{r}
+ggplot(JdatT, aes(x=wl,y=avTrans,color=spot)) +
+  geom_line()+
+  xlim(420,1100)+
+  ylim(0,85)+
+  ylab("Transmittance (%)")+
+  xlab("Wavelength (nm)")+
+  facet_wrap(~spp)+
+  theme_bw()
+
+```
+
+## Sun Irradiance
+
+```{r}
+SunRaw <- read.csv("Data/RawSun/SolarIrradiance.csv") 
+```
+
+To make sure that the sun irradiance and samples are in the same wavelength range (400 - 1100 nm) and the wavelength varies in steps of the same size (0.1 nanometers), we use the function "smooth curve" set in the "functions" section of this document. 
+
+And we define the parameters for vis nir (these will change for midIR).
+
+```{r}
+#Parameters for vis nir
+interval_sizeVN <- 0.1
+min_wavelengthVN <- 420
+max_wavelengthVN <- 1100
+
+smoo_sun <- smooth_curve(SunRaw, interval_sizeVN, 
+                             min_wavelengthVN, max_wavelengthVN)
+
+length(smoo_sun$wavelength)
+
+plot(smoo_sun, type="l")
+
+```
+
+
+## midIR
+
+hemispherical reflectance of long wavelengths was measured with a gold covered integrating sphere. Transmittance was measured with the microscope (no lenses, mirror objectives).
+
+
+### Reflectance 
+
+import and clean data. Use the function to import data set at the begining of this document.
+
+```{r}
+directory1 <- "Data/midIR/mirIRHemisphericalReflectance"
+master_df2 <- import_dpt_files(directory1)
+head(master_df2)
+```
+
+arrange data frame and get the mean across the repetitions.
+
+```{r}
+
+midirRef <- master_df2 %>% 
+  mutate(wl = 10000/wavenumber, # calculate wavelength (x axis)
+         spp = substr(filename, 1,6), # species
+         spot = substr(filename, 8, 12) # different spots
+         ) %>% 
+  select(spp,spot, wl,percent) %>% 
+  group_by(spp, spot, wl) %>% 
+  summarise(meanRef = mean(percent), # average across repetitions
+            sdRef = sd(percent), # sd accross repetitions
+            nRef = length(percent))
+
+head(midirRef)
+
+```
+
+#### Plot elytra
+
+First subset by elytra
+```{r}
+ReflElDor <- midirRef %>% 
+  filter(spot == "ElDor")
+
+ggplot(ReflElDor, aes(x=wl, y=meanRef, group = spp, col=spp))+
+  geom_line()+
+  theme_bw()
+```
+
+#### Plot body parts
+
+```{r}
+
+ReflWA <- midirRef %>% 
+  filter(spp == "Tbruck" | 
+         spp == "Tbonvo") 
+
+head(ReflWA)
+table(ReflWA$spot)
+
+ggplot(ReflWA, aes(x=wl, y=meanRef, col=spot))+
+  geom_line()+
+  facet_wrap(~spp)+
+  theme_bw()
+
+```
+
+
+### Transmittance
+
+Import data
+
+```{r}
+directory3 <- "Data/midIR/mirIRTransmittanceMicroscope"
+master_df3 <- import_dpt_files(directory3)
+head(master_df3)
+```
+
+Arrange data frame
+
+```{r}
+
+midirTra <- master_df3 %>% 
+  mutate(wl = 10000/wavenumber, # conver wave number to wavelength
+         spp = substr(filename, 1,6), # species
+         spot = substr(filename, 8,12)# separate by spot
+         ) %>% 
+  select(spp,spot, wl,percent) %>% 
+  group_by(spp, spot, wl) %>% 
+  summarise(meanTra = mean(percent), 
+            sdTra = sd(percent),
+            nTra = length(percent))
+
+head(midirTra)
+unique(midirTra$spot)
+
+```
+
+
+#### Plot elytra
+
+First subset by elytra
+```{r}
+TrElytraDor <- midirTra %>% 
+  filter(spot == "ElDor")
+summary(TrElytraDor)
+
+TrElytraVen <- midirTra %>% 
+  filter(spot == "ElVen")
+
+TrRightWing <- midirTra %>% 
+  filter(spot == "RWing")
+
+
+ggplot(TrElytraDor, aes(x=wl, y=meanTra, col=spp))+
+  geom_ribbon(aes(ymin = meanTra - sdTra, 
+                  ymax = meanTra + sdTra, 
+                  group = spp, fill = spp),
+              alpha = 0.4, colour = NA) +
+  geom_line()+
+  theme_bw()
+
+ggplot(TrElytraVen, aes(x=wl, y=meanTra, col=spp))+
+  geom_ribbon(aes(ymin = meanTra - sdTra, 
+                  ymax = meanTra + sdTra, 
+                  group = spp, fill = spp),
+              alpha = 0.4, colour = NA) +
+  geom_line()+
+  theme_bw()
+
+
+ggplot(TrRightWing, aes(x=wl, y=meanTra, col=spp))+
+  geom_ribbon(aes(ymin = meanTra - sdTra, 
+                  ymax = meanTra + sdTra, 
+                  group = spp, fill = spp),
+              alpha = 0.4, colour = NA) +
+  geom_line()+
+  theme_bw()
+
+```
+
+
+notes: ** if the elytron does not contain a lot of living tissue, maybe it does not need to dissipate heat, that would explain higer transmittance. Would this be the case of E. lamp?
+
+Or is it due to the thickness of the chiral stack??? or maybe due to roughness???
+
+
+
+#### Plot Elytral chamber
+
+```{r}
+TranWA <- midirTra %>% 
+  filter(spp == "Tbruck" | 
+         spp == "Tbonvo") 
+
+head(TranWA)
+
+ggplot(TranWA, aes(x=wl, y=meanTra, col=spot))+
+  geom_ribbon(aes(ymin = meanTra - sdTra, 
+                  ymax = meanTra + sdTra, 
+                  group = spot, fill = spot), alpha=0.2, colour=NA)+
+  geom_line()+
+  theme_bw()+
+  facet_wrap(~spp)
+
+```
+
+
+## Black Body
+
+These files contain a column for wavelength in microns and radiance in photons/s/m2/sr/micron.
+
+```{r}
+directory5 <-"Data/RawBlackBody"
+```
+
+```{r}
+
+# import data
+Temp293<-read.table("Data/RawBlackBody/Temp293K.txt",header=TRUE) %>% 
+  filter(wavelength>=3)# 19.85C
+Temp300<-read.table("Data/RawBlackBody/Temp300K.txt",header=TRUE) %>% 
+  filter(wavelength>=3)# 26.85C
+Temp321<-read.table("Data/RawBlackBody/Temp321K.txt",header=TRUE) %>% 
+  filter(wavelength>=3)# 47.85
+Temp333<-read.table("Data/RawBlackBody/Temp333K.txt",header=TRUE) %>% 
+  filter(wavelength>=3)# 59.85
+Temp343<-read.table("Data/RawBlackBody/Temp343K.txt",header=TRUE) %>% 
+  filter(wavelength>=3)# 69.85
+
+plot(Temp343,type="l")
+lines(Temp333, col="green")
+lines(Temp321, col="pink")
+lines(Temp300, col="red")
+lines(Temp293, col="blue")
+
+```
+
+To make sure that the black body radiation and samples are in the same wavelength range (3 - 16 microns) and the wavelength varies in steps of the same size (0.0001 microns), we use the function "smooth curve" set in the "functions" section of this document.
+
+
+```{r}
+#Parameters for midIR
+interval_size <- 0.0001
+min_wavelength <- 3
+max_wavelength <- 16
+
+smoo_Temp293 <- smooth_curve(Temp293, interval_size, 
+                             min_wavelength, max_wavelength)
+smoo_Temp300 <- smooth_curve(Temp300, interval_size, 
+                             min_wavelength, max_wavelength)
+smoo_Temp321 <- smooth_curve(Temp321, interval_size, 
+                             min_wavelength, max_wavelength)
+smoo_Temp333 <- smooth_curve(Temp333, interval_size, 
+                             min_wavelength, max_wavelength)
+smoo_Temp343 <- smooth_curve(Temp343, interval_size, 
+                             min_wavelength, max_wavelength)
+
+```
+
+To confirm: 
+
+```{r}
+summary(smoo_Temp343)
+length(smoo_Temp343$wavelength)
+```
+
+# Weighted Data
+
+## VIs-NIR Transmission
+
+
+##### Step 1 - Setting up
+
+We used the function smooth_all_curves to make sure that the transmittance data is in the same wavelength range (400 ) and the wavelength varies in steps of the same size (0.0001 microns). This function is required to apply the smoothing in multiple columns of a data frame all at once. 
+
+```{r}
+
+TrJdat.SP <- JdatT %>%
+  ungroup() %>% 
+  unite("treat", spp, spot, sep ="_") %>% 
+  select(treat,wl,avTrans) %>% 
+  spread(treat,avTrans) %>% 
+  filter(wl>=420)
+
+smoo_TrJdat <- smooth_all_curves(TrJdat.SP, interval_sizeVN, 
+                             min_wavelengthVN, max_wavelengthVN)
+
+head(TrJdat.SP)
+head(smoo_TrJdat)
+length(smoo_TrJdat$wavelength)
+
+```
+
+##### Step 2 -  multiplication
+
+Multiply the sample transmittance * sun irradiance. In order to do this, use the function "multiply_sample_bb"
+
+```{r}
+TrJdatSun <- multiply_sample_bb(smoo_sun, smoo_TrJdat)
+head(TrJdatSun)
+```
+
+This is the comparison of the raw and weighted data for A. aureus: 
+```{r}
+par(mfrow=c(1,2))
+plot(smoo_TrJdat[,1:2], type="l", ylab= "Raw transmittance")
+plot(TrJdatSun[,1:2], type="l", ylab= "Weighted transmittance")
+```
+
+##### Step 3 -  Integral
+
+We use the function "area under the curve" to calculate the integral under the weighted curve.
+```{r}
+Transmissivity <- calculate_auc(TrJdatSun)/calculate_auc(smoo_sun)
+Transmissivity
+```
+
+
+
+## VIS-NIR Reflection
+
+
+##### Step 1 - Setting up
+
+We used the function smooth_all_curves to make sure that the transmittance data is in the same wavelength range (400 ) and the wavelength varies in steps of the same size (0.0001 microns). This function is required to apply the smoothing in multiple columns of a data frame all at once. 
+
+```{r}
+
+RfJdat.SP <- JdatR %>%
+  ungroup() %>% 
+  select(treat,wl,avReflect) %>% 
+  spread(treat,avReflect) %>% 
+  filter(wl>=420)
+
+smoo_RfJdat <- smooth_all_curves(RfJdat.SP, interval_sizeVN, 
+                             min_wavelengthVN, max_wavelengthVN)
+
+head(RfJdat.SP)
+head(smoo_RfJdat)
+length(smoo_RfJdat$wavelength)
+
+```
+
+##### Step 2 -  multiplication
+
+Multiply the sample transmittance * sun irradiance. In order to do this, use the function "multiply_sample_bb"
+
+```{r}
+RfJdatSun <- multiply_sample_bb(smoo_sun, smoo_RfJdat)
+head(RfJdatSun)
+```
+
+This is the comparison of the raw and weighted data for A. aureus: 
+```{r}
+par(mfrow=c(1,2))
+plot(smoo_RfJdat[,1:2], type="l", ylab= "Raw reflectance")
+plot(RfJdatSun[,1:2], type="l", ylab= "Weighted reflectance")
+```
+
+##### Step 3 -  Integral
+
+We use the function "area under the curve" to calculate the integral under the weighted curve.
+```{r}
+Reflectivity <- calculate_auc(RfJdatSun)/calculate_auc(smoo_sun)
+Reflectivity
+```
+
+
+
+
+
+
+## IR transmission
+
+### Elytra Dorsal
+
+##### Step 1 - Setting up
+
+We used the function smooth_all_curves to make sure that the transmittance data is in the same wavelength range (3 - 16 microns) and the wavelength varies in steps of the same size (0.0001 microns). This function is required to apply the smoothing in multiple columns of a data frame all at once. 
+
+```{r}
+TrElytraDor.SP <- TrElytraDor %>%
+  ungroup() %>% 
+  select(spp,wl,meanTra) %>% 
+  spread(spp,meanTra) %>% 
+  filter(wl>=3)
+
+smoo_TrElytraDor <- smooth_all_curves(TrElytraDor.SP, interval_size, 
+                             min_wavelength, max_wavelength)
+ 
+```
+
+To confirm:
+```{r}
+summary(smoo_TrElytraDor$wavelength) 
+length(smoo_TrElytraDor$wavelength)
+```
+
+##### Step 2 -  multiplication
+
+Multiply the sample transmittance * black body radiation at a given temperature. In order to do this, use the function "multiply_sample_bb"
+
+```{r}
+Tr.Ely.300bb <- multiply_sample_bb(smoo_Temp300, smoo_TrElytraDor)
+head(Tr.Ely.300bb)
+```
+
+This is the comparison of the raw and weighted data for A. aureus: 
+```{r}
+par(mfrow=c(1,2))
+plot(smoo_TrElytraDor[,1:2], type="l", ylab= "Raw transmittance")
+plot(Tr.Ely.300bb[,1:2], type="l", ylab= "Weighted transmittance")
+```
+
+Now, multiply for the black body radiation at different temperatures: 
+
+```{r}
+Tr.Ely.293bb <- multiply_sample_bb(smoo_Temp293, smoo_TrElytraDor)
+Tr.Ely.300bb <- multiply_sample_bb(smoo_Temp300, smoo_TrElytraDor)
+Tr.Ely.321bb <- multiply_sample_bb(smoo_Temp321, smoo_TrElytraDor)
+Tr.Ely.333bb <- multiply_sample_bb(smoo_Temp333, smoo_TrElytraDor)
+Tr.Ely.343bb <- multiply_sample_bb(smoo_Temp343, smoo_TrElytraDor)
+```
+
+##### Step 3 -  Integral
+
+We use the function "area under the curve" to calculate the integral under the weighted curve.
+```{r}
+IRTra_Ely_293bb <- 1-(calculate_auc(Tr.Ely.293bb)/calculate_auc(smoo_Temp293))
+IRTra_Ely_300bb <- 1-(calculate_auc(Tr.Ely.300bb)/calculate_auc(smoo_Temp300))
+IRTra_Ely_321bb <- 1-(calculate_auc(Tr.Ely.321bb)/calculate_auc(smoo_Temp321))
+IRTra_Ely_333bb <- 1-(calculate_auc(Tr.Ely.333bb)/calculate_auc(smoo_Temp333))
+IRTra_Ely_343bb <- 1-(calculate_auc(Tr.Ely.343bb)/calculate_auc(smoo_Temp343))
+```
+
+##### Step 4 - plot
+
+```{r}
+IRTr = c(IRTra_Ely_293bb, IRTra_Ely_300bb, IRTra_Ely_321bb, 
+         IRTra_Ely_333bb, IRTra_Ely_343bb)
+
+IRTra_Ely_pivot <- data.frame(
+  species = names(IRTr),
+  value = as.numeric(IRTr),
+  bbTemp = substr(
+    c(rep("IRTra_Ely_293bb",length(IRTra_Ely_293bb)), 
+             rep("IRTra_Ely_300bb",length(IRTra_Ely_300bb)), 
+             rep("IRTra_Ely_321bb",length(IRTra_Ely_321bb)), 
+             rep("IRTra_Ely_333bb",length(IRTra_Ely_333bb)),
+             rep("IRTra_Ely_343bb",length(IRTra_Ely_343bb))),
+    11,15)
+)
+
+ggplot(IRTra_Ely_pivot, aes(fill=bbTemp, y=value, x=species)) + 
+  geom_bar(position="dodge", stat="identity")+
+  ylim(0,1)+
+  theme_bw()
+
+new_labels <- c("293K | 19.8C", 
+                "300K | 26.8C", 
+                "321K | 47.8C", 
+                "333K | 59.8C", 
+                "343K | 69.8C")
+
+ggplot(IRTra_Ely_pivot, aes(x=bbTemp, y=value))+
+  geom_boxplot(fill="pink")+
+  geom_point(aes(y=value), cex=3, pch=21)+
+  geom_text_repel(aes(label = species), size = 3) + # Add species names as labels
+  scale_x_discrete(labels = new_labels) +  # Change x-axis labels
+  ylab("Calc. Emissivity")+
+  theme_bw()
+
+
+```
+
+Some preliminary stats for one of the outliers: 
+
+```{r}
+# Example sample data
+sample_data <- IRTra_Ely_pivot[IRTra_Ely_pivot$bbTemp == "293bb",2]
+
+# Specify the single observed value
+observed_value <- IRTra_Ely_pivot[IRTra_Ely_pivot$species=="Elampr" 
+                       & IRTra_Ely_pivot$bbTemp == "293bb",2]
+
+# Calculate the sample mean and standard deviation
+sample_mean <- mean(sample_data)
+sample_sd <- sd(sample_data)
+n <- length(sample_data)
+
+# Calculate the t-score
+t_score <- (observed_value - sample_mean) / (sample_sd / sqrt(n))
+
+# Calculate the p-value for the t-score
+p_value <- 2 * pt(-abs(t_score), df = n - 1)
+
+# Print the results
+cat("t-score:", t_score, "\n")
+cat("p-value:", p_value, "\n")
+
+```
+
+
+### Elytra Ventral 
+
+##### Step 1 - Setting up
+
+We used the function smooth_all_curves to make sure that the transmittance data is in the same wavelength range (3 - 16 microns) and the wavelength varies in steps of the same size (0.0001 microns). This function is required to apply the smoothing in multiple columns of a data frame all at once. 
+
+```{r}
+TrElytraVen.SP <- TrElytraVen %>%
+  ungroup() %>% 
+  select(spp,wl,meanTra) %>% 
+  spread(spp,meanTra) %>% 
+  filter(wl>=3)
+
+smoo_TrElytraVen <- smooth_all_curves(TrElytraVen.SP, interval_size, 
+                             min_wavelength, max_wavelength)
+ 
+```
+
+To confirm:
+```{r}
+summary(smoo_TrElytraVen$wavelength) 
+length(smoo_TrElytraVen$wavelength)
+```
+
+##### Step 2 -  multiplication
+
+Multiply the sample transmittance * black body radiation at a given temperature. In order to do this, use the function "multiply_sample_bb"
+
+```{r}
+Tr.ElV.300bb <- multiply_sample_bb(smoo_Temp300, smoo_TrElytraVen)
+head(Tr.ElV.300bb)
+```
+
+This is the comparison of the raw and weighted data for A. aureus: 
+```{r}
+par(mfrow=c(1,2))
+plot(smoo_TrElytraVen[,1:2], type="l", ylab= "Raw transmittance")
+plot(Tr.ElV.300bb[,1:2], type="l", ylab= "Weighted transmittance")
+```
+
+Now, multiply for the black body radiation at different temperatures: 
+
+```{r}
+Tr.ElV.293bb <- multiply_sample_bb(smoo_Temp293, smoo_TrElytraVen)
+Tr.ElV.300bb <- multiply_sample_bb(smoo_Temp300, smoo_TrElytraVen)
+Tr.ElV.321bb <- multiply_sample_bb(smoo_Temp321, smoo_TrElytraVen)
+Tr.ElV.333bb <- multiply_sample_bb(smoo_Temp333, smoo_TrElytraVen)
+Tr.ElV.343bb <- multiply_sample_bb(smoo_Temp343, smoo_TrElytraVen)
+```
+
+##### Step 3 -  Integral
+
+We use the function "area under the curve" to calculate the integral under the weighted curve.
+```{r}
+IRTra_ElV_293bb <- 1-(calculate_auc(Tr.ElV.293bb)/calculate_auc(smoo_Temp293))
+IRTra_ElV_300bb <- 1-(calculate_auc(Tr.ElV.300bb)/calculate_auc(smoo_Temp300))
+IRTra_ElV_321bb <- 1-(calculate_auc(Tr.ElV.321bb)/calculate_auc(smoo_Temp321))
+IRTra_ElV_333bb <- 1-(calculate_auc(Tr.ElV.333bb)/calculate_auc(smoo_Temp333))
+IRTra_ElV_343bb <- 1-(calculate_auc(Tr.ElV.343bb)/calculate_auc(smoo_Temp343))
+```
+
+##### Step 4 -  plot
+
+```{r}
+IRTrV = c(IRTra_ElV_293bb, IRTra_ElV_300bb, IRTra_ElV_321bb, 
+         IRTra_ElV_333bb, IRTra_ElV_343bb)
+
+IRTra_ElV_pivot <- data.frame(
+  species = names(IRTrV),
+  value = as.numeric(IRTrV),
+  bbTemp = substr(
+    c(rep("IRTra_ElV_293bb",length(IRTra_ElV_293bb)), 
+             rep("IRTra_ElV_300bb",length(IRTra_ElV_300bb)), 
+             rep("IRTra_ElV_321bb",length(IRTra_ElV_321bb)), 
+             rep("IRTra_ElV_333bb",length(IRTra_ElV_333bb)),
+             rep("IRTra_ElV_343bb",length(IRTra_ElV_343bb))),
+    11,15)
+)
+
+ggplot(IRTra_ElV_pivot, aes(fill=bbTemp, y=value, x=species)) + 
+  geom_bar(position="dodge", stat="identity")+
+  ylim(0,1)+
+  theme_bw()
+
+new_labels <- c("293K | 19.8C", 
+                "300K | 26.8C", 
+                "321K | 47.8C", 
+                "333K | 59.8C", 
+                "343K | 69.8C")
+
+ggplot(IRTra_ElV_pivot, aes(x=bbTemp, y=value))+
+  geom_boxplot(fill="pink")+
+  geom_point(aes(y=value), cex=3, pch=21)+
+  geom_text_repel(aes(label = species), size = 3) + # Add species names as labels
+  scale_x_discrete(labels = new_labels) +  # Change x-axis labels
+  ylab("Calc. Emissivity")+
+  theme_bw()
+```
+
+
+### Dorsal-Ventral comparison
+
+In order to test if there is any difference in the transmittance of the elytra from the dorsal or ventral side.
+```{r}
+CompEly <- inner_join(IRTra_ElV_pivot, IRTra_Ely_pivot,  
+                      by = c("species", "bbTemp")) %>% 
+  rename(VentralTr = value.x ,
+         DorsalTr = value.y) %>% 
+  mutate(Diff = DorsalTr-VentralTr)
+
+# Statistical tests
+wilcox.test((CompEly)[CompEly$bbTemp=="293bb",]$Diff,mu=0) # non parametric test used
+summary(CompEly$Diff) # descriptive stats
+
+# Create the base scatter plot
+p <- ggplot(CompEly, 
+            aes(x = VentralTr, y = DorsalTr, group=bbTemp, colour=bbTemp)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  geom_point(pch=16, cex=3) +
+  geom_text_repel(aes(label = species), size = 3) + # Add species names as labels
+  labs(x = "Ventral Emissivity", y = "Dorsal Emissivity")+
+  theme_bw() +
+  xlim(0.9,1)+
+  ylim(0.9,1)+
+  theme(legend.position = "bottom")
+
+
+# Add marginal histograms
+p_with_margins <- ggMarginal(p, type = "histogram", bins = 30, 
+                             fill = "skyblue", color = "black")
+
+# Display the plot
+print(p_with_margins)
+
+```
+
+
+
+### Right Wing
+
+
+## IR Reflection
+
+### Elytra dorsal
+
+
+##### Step 1 - Setting up
+
+We used the function smooth_all_curves to make sure that the transmittance data is in the same wavelength range (3 - 16 microns) and the wavelength varies in steps of the same size (0.0001 microns). This function is required to apply the smoothing in multiple columns of a data frame all at once. 
+
+```{r}
+ReflElDor.SP <- ReflElDor %>%
+  ungroup() %>% 
+  select(spp,wl,meanRef) %>% 
+  spread(spp,meanRef) %>% 
+  filter(wl>=3)
+
+smoo_ReflElDor <- smooth_all_curves(ReflElDor.SP, interval_size, 
+                             min_wavelength, max_wavelength)
+ 
+```
+
+To confirm:
+```{r}
+summary(smoo_ReflElDor$wavelength) 
+length(smoo_ReflElDor$wavelength)
+```
+
+##### Step 2 -  multiplication
+
+Multiply the sample transmittance * black body radiation at a given temperature. In order to do this, use the function "multiply_sample_bb"
+
+```{r}
+Tr.Ely.300bb <- multiply_sample_bb(smoo_Temp300, smoo_ReflElDor)
+head(Tr.Ely.300bb)
+```
+
+This is the comparison of the raw and weighted data for A. aureus: 
+```{r}
+par(mfrow=c(1,2))
+plot(smoo_ReflElDor[,1:2], type="l", ylab= "Raw reflectance")
+plot(Tr.Ely.300bb[,1:2], type="l", ylab= "Weighted reflectance")
+```
+
+Now, multiply for the black body radiation at different temperatures: 
+
+```{r}
+Rf.Ely.293bb <- multiply_sample_bb(smoo_Temp293, smoo_ReflElDor)
+Rf.Ely.300bb <- multiply_sample_bb(smoo_Temp300, smoo_ReflElDor)
+Rf.Ely.321bb <- multiply_sample_bb(smoo_Temp321, smoo_ReflElDor)
+Rf.Ely.333bb <- multiply_sample_bb(smoo_Temp333, smoo_ReflElDor)
+Rf.Ely.343bb <- multiply_sample_bb(smoo_Temp343, smoo_ReflElDor)
+```
+
+##### Step 3 -  Integral
+
+We use the function "area under the curve" to calculate the integral under the weighted curve.
+```{r}
+IRRef_Ely_293bb <- 1-(calculate_auc(Rf.Ely.293bb)/calculate_auc(smoo_Temp293))
+IRRef_Ely_300bb <- 1-(calculate_auc(Rf.Ely.300bb)/calculate_auc(smoo_Temp300))
+IRRef_Ely_321bb <- 1-(calculate_auc(Rf.Ely.321bb)/calculate_auc(smoo_Temp321))
+IRRef_Ely_333bb <- 1-(calculate_auc(Rf.Ely.333bb)/calculate_auc(smoo_Temp333))
+IRRef_Ely_343bb <- 1-(calculate_auc(Rf.Ely.343bb)/calculate_auc(smoo_Temp343))
+```
+
+##### Step 4 - plot
+
+```{r}
+IRRf <- c(IRRef_Ely_293bb, IRRef_Ely_300bb, IRRef_Ely_321bb, 
+         IRRef_Ely_333bb, IRRef_Ely_343bb)
+
+IRRef_Ely_pivot <- data.frame(
+  species = names(IRRf),
+  value = as.numeric(IRRf),
+  bbTemp = substr(
+    c(rep("IRRef_Ely_293bb",length(IRRef_Ely_293bb)), 
+             rep("IRRef_Ely_300bb",length(IRRef_Ely_300bb)), 
+             rep("IRRef_Ely_321bb",length(IRRef_Ely_321bb)), 
+             rep("IRRef_Ely_333bb",length(IRRef_Ely_333bb)),
+             rep("IRRef_Ely_343bb",length(IRRef_Ely_343bb))),
+    11,15)
+)
+
+ggplot(IRRef_Ely_pivot, aes(fill=bbTemp, y=value, x=species)) + 
+  geom_bar(position="dodge", stat="identity")+
+  ylim(0,1)+
+  theme_bw()
+
+new_labels <- c("293K | 19.8C", 
+                "300K | 26.8C", 
+                "321K | 47.8C", 
+                "333K | 59.8C", 
+                "343K | 69.8C")
+
+ggplot(IRRef_Ely_pivot, aes(x=bbTemp, y=value))+
+  geom_boxplot(fill="pink")+
+  geom_point(aes(y=value), cex=3, pch=21)+
+  geom_text_repel(aes(label = species), size = 3) + # Add species names as labels
+  scale_x_discrete(labels = new_labels) +  # Change x-axis labels
+  theme_bw()
+
+
+```
+
+
+### Body Parts WA
+
+##### Step 1 - Setting up
+
+```{r}
+ReflWA.SP <- ReflWA %>% 
+  ungroup() %>% 
+  unite("sppspot", spp:spot) %>% 
+  select(sppspot,wl,meanRef) %>% 
+  spread(sppspot,meanRef) %>% 
+  filter(wl>=3)
+
+smoo_ReflWA<- smooth_all_curves(ReflWA.SP, interval_size, 
+                             min_wavelength, max_wavelength)
+```
+
+##### Step 2 -  multiplication
+
+Multiply the sample transmittance * black body radiation at a given temperature. In order to do this, use the function "multiply_sample_bb"
+
+```{r}
+ReflWA.300bb <- multiply_sample_bb(smoo_Temp300, smoo_ReflWA)
+head(ReflWA.300bb)
+```
+
+Now, multiply for the black body radiation at different temperatures: 
+
+```{r}
+Rf.WA.293bb <- multiply_sample_bb(smoo_Temp293, smoo_ReflWA)
+Rf.WA.300bb <- multiply_sample_bb(smoo_Temp300, smoo_ReflWA)
+Rf.WA.321bb <- multiply_sample_bb(smoo_Temp321, smoo_ReflWA)
+Rf.WA.333bb <- multiply_sample_bb(smoo_Temp333, smoo_ReflWA)
+Rf.WA.343bb <- multiply_sample_bb(smoo_Temp343, smoo_ReflWA)
+```
+
+##### Step 3 -  Integral
+
+We use the function "area under the curve" to calculate the integral under the weighted curve.
+```{r}
+IRRef_WA_293bb <- 1-(calculate_auc(Rf.WA.293bb)/calculate_auc(smoo_Temp293))
+IRRef_WA_300bb <- 1-(calculate_auc(Rf.WA.300bb)/calculate_auc(smoo_Temp300))
+IRRef_WA_321bb <- 1-(calculate_auc(Rf.WA.321bb)/calculate_auc(smoo_Temp321))
+IRRef_WA_333bb <- 1-(calculate_auc(Rf.WA.333bb)/calculate_auc(smoo_Temp333))
+IRRef_WA_343bb <- 1-(calculate_auc(Rf.WA.343bb)/calculate_auc(smoo_Temp343))
+```
+
+##### Step 4 - plot
+
+```{r}
+IRRfWA <- c(IRRef_WA_293bb, IRRef_WA_300bb, IRRef_WA_321bb, 
+         IRRef_WA_333bb, IRRef_WA_343bb)
+
+IRRef_WA_pivot <- data.frame(
+  sppspot = names(IRRfWA),
+  value = as.numeric(IRRfWA),
+  bbTemp = substr(
+    c(rep("IRRef_WA_293bb",length(IRRef_WA_293bb)), 
+             rep("IRRef_WA_300bb",length(IRRef_WA_300bb)), 
+             rep("IRRef_WA_321bb",length(IRRef_WA_321bb)), 
+             rep("IRRef_WA_333bb",length(IRRef_WA_333bb)),
+             rep("IRRef_WA_343bb",length(IRRef_WA_343bb))),
+    10,14)
+) %>% 
+  mutate(spp = substr(sppspot,1,6),
+         bodypart = substr(sppspot,8,12)) 
+  
+
+
+new_labels <- c("293K | 19.8C", 
+                "300K | 26.8C", 
+                "321K | 47.8C", 
+                "333K | 59.8C", 
+                "343K | 69.8C")
+
+ggplot(IRRef_WA_pivot, aes(x=bbTemp, y=value))+
+  geom_boxplot(fill="pink")+
+  geom_point(aes(y=value), cex=3, pch=21)+
+  geom_text_repel(aes(label = bodypart), size = 3) + # Add species names as labels
+  scale_x_discrete(labels = new_labels) +  # Change x-axis labels
+  facet_wrap(~spp)+
+  theme_bw()
+
+
+```
+
+
+
+
+
+# Synthesis
+
+
+## visNIR
+
+```{r}
+Absorptivity <- 100 - (Transmissivity  + Reflectivity)
+
+PivotSun <- data.frame (
+  sppspot = c(names(Absorptivity),
+              names(Transmissivity),
+              names(Reflectivity)),
+  value = c(as.numeric(Absorptivity),
+            as.numeric(Transmissivity),
+            as.numeric(Reflectivity)),
+  Oprop = c(rep("Absorptivity",length(Absorptivity)),
+            rep("Transmissivity", length(Transmissivity)),
+            rep("Reflectivity", length(Reflectivity))
+            )) %>% 
+  mutate(spp = substr(sppspot,1,7),
+         spot = substr(sppspot,16,21),
+         manip = substr(sppspot, 9, 14)) %>% 
+  unite("SppTreat", spp, manip, sep="_", remove=FALSE) %>% 
+  select(SppTreat , spot, value, Oprop, manip)
+
+
+PivotSun$alpha <- ifelse(PivotSun$manip == "alterd", 0.5, 1)
+
+```
+
+Plot
+
+### Bright spots
+```{r}
+ggplot(PivotSun[PivotSun$spot=="bright",], 
+       aes(x = SppTreat,
+           y = value, fill = Oprop ,
+           alpha = alpha)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Species", y = "Value") +
+  scale_fill_manual(values=c( "#4682B4", "#9ACD32","#FFA500"))+
+  scale_alpha_identity() +  # Use identity scale for alpha
+  coord_flip()+
+  theme_minimal()
+
+```
+
+
+### Dark spots
+
+```{r}
+
+ggplot(PivotSun[PivotSun$spot=="darkpt",], 
+       aes(x = SppTreat,
+           y = value, fill = Oprop ,
+           alpha = alpha)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Species", y = "Value") +
+  scale_fill_manual(values=c( "#4682B4", "#FFA500", "#9ACD32"))+
+  scale_alpha_identity() +  # Use identity scale for alpha
+  coord_flip()+
+  theme_minimal()
+
+
+```
+
+### What wavlenegths?
+
+
+Only transmittance //  Comparing if there is more change in the visible or NIR part of the spectrum after alteration (scraping of the material below the upper lamination)
+
+```{r}
+TransmVIS <- calculate_auc(TrJdatSun[TrJdatSun$wavelength<700,])/       calculate_auc(smoo_sun[smoo_sun$wavelength<700,])
+
+TransmNIR <- calculate_auc(TrJdatSun[TrJdatSun$wavelength>=700,])/       calculate_auc(smoo_sun[smoo_sun$wavelength>=700,])
+
+PivotTransmT <- data.frame (
+  sppspot = c(names(TransmVIS),
+              names(TransmNIR)),
+  value = c(as.numeric(TransmVIS),
+            as.numeric(TransmNIR)),
+  Band = c(rep("TransmVIS",length(TransmVIS)),
+            rep("TransmNIR", length(TransmNIR))
+            )) %>% 
+  mutate(spp = substr(sppspot,1,7),
+         spot = substr(sppspot,16,21),
+         manip = substr(sppspot, 9, 14)) %>% 
+  unite("SppTreat", spp, manip, sep="_", remove=FALSE) %>% 
+  select(SppTreat , spot, value, Band, manip)
+
+PivotTransmT$alpha <- ifelse(PivotTransmT$manip == "alterd", 0.5, 1)
+
+
+ggplot(PivotTransmT[PivotTransmT$spot=="bright",], 
+       aes(x = SppTreat,
+           y = value, alpha = alpha)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.5)) +
+  labs(x = "Species", y = "Value") +
+  scale_fill_manual("#FFA500")+
+  scale_alpha_identity() +  # Use identity scale for alpha
+  facet_wrap(~Band)+
+  coord_flip()+
+  theme_minimal()
+
+
+```
+
+
+Full properties//  Comparing if there is more change in the visible or NIR part of the spectrum after alteration (scraping of the material below the upper lamination)
+
+```{r}
+ReflecVIS <- calculate_auc(RfJdatSun[RfJdatSun$wavelength<700,])/       calculate_auc(smoo_sun[smoo_sun$wavelength<700,])
+
+ReflecNIR <- calculate_auc(RfJdatSun[RfJdatSun$wavelength>=700,])/       calculate_auc(smoo_sun[smoo_sun$wavelength>=700,])
+
+AbsorbVIS <- 100 - (ReflecVIS + TransmVIS)
+AbsorbNIR <- 100 - (ReflecNIR + TransmNIR)
+
+PivotBands <- data.frame (
+  sppspot = c(names(AbsorbVIS),
+              names(TransmVIS),
+              names(ReflecVIS),
+              names(AbsorbNIR),
+              names(TransmNIR),
+              names(ReflecNIR)),
+  value = c(as.numeric(AbsorbVIS),
+            as.numeric(TransmVIS),
+            as.numeric(ReflecVIS),
+            as.numeric(AbsorbNIR),
+            as.numeric(TransmNIR),
+            as.numeric(ReflecNIR)),
+  Oprop = c(rep("AbsorbVIS",length(AbsorbVIS)),
+            rep("TransmVIS", length(TransmVIS)),
+            rep("ReflecVIS", length(ReflecVIS)),
+            rep("AbsorbNIR",length(AbsorbNIR)),
+            rep("TransmNIR", length(TransmNIR)),
+            rep("ReflecNIR", length(ReflecNIR))
+            )) %>% 
+  mutate(spp = substr(sppspot,1,7),
+         spot = substr(sppspot,16,21),
+         manip = substr(sppspot, 9, 14),
+         band = substr(Oprop,7,9)) %>% 
+  unite("SppTreat", spp, manip, sep="_", remove=FALSE) %>% 
+  select(SppTreat , spot, value, Oprop, band, manip)
+
+
+PivotBands$alpha <- ifelse(PivotBands$manip == "alterd", 0.5, 1)
+
+
+PivotBands[PivotBands$SppTreat=="T.bruck_alterd",]
+```
+
+Now plot
+
+```{r}
+ggplot(PivotBands[PivotBands$spot=="bright",], 
+       aes(x = SppTreat,
+           y = value, fill = Oprop ,
+           alpha = alpha)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Species", y = "Value") +
+  #scale_fill_manual(values=c( "#4682B4", "#9ACD32","#FFA500"))+
+  scale_alpha_identity() +  # Use identity scale for alpha
+  coord_flip()+
+  scale_fill_manual(values=c( "#4682B4","#4682B4",
+                              "#9ACD32","#9ACD32", 
+                              "#FFA500","#FFA500"))+
+  facet_wrap(~band)+
+  theme_minimal()
+
+```
+
+## midIR
+
+```{r}
+names(IRTra_Ely_pivot) <- c("spp", "pAUCTr", "bbTemp")
+names(IRRef_Ely_pivot ) <- c("spp", "pAUCRf", "bbTemp")
+
+Consolidated <- inner_join(IRTra_Ely_pivot, IRRef_Ely_pivot ,
+                           by=c("spp","bbTemp")) %>% 
+  mutate(AUCTr = 1-pAUCTr,
+         AUCRf = 1-pAUCRf, 
+         Emiss = 1- (AUCTr + AUCRf)) %>% 
+  select(spp, bbTemp, AUCTr,AUCRf, Emiss)
+
+PivotCon <- Consolidated %>% 
+  gather(Measurement, ElyResponse, -spp, -bbTemp)
+
+unique(PivotCon$bbTemp)
+```
+
+PLots
+
+293K
+```{r}
+pospos <- c("Tbruck","Tbonvo", "Csexpl" , "Crayne", "Coctos", 
+            "Elampr", "Aparvu", "Aaureu", "Aopali", "Alaetu") #define order
+
+ggplot(PivotCon[PivotCon$bbTemp=="293bb",], 
+       aes(x = factor(spp, levels =pospos),
+           y = ElyResponse, fill = Measurement)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Species", y = "Value", fill = "Variable") +
+  scale_fill_manual(values=c( "#FFA500", "#9ACD32", "#4682B4"))+
+  coord_flip()+
+  geom_hline(yintercept = 0.91, lty=2)+
+  theme_minimal()
+
+PivotCon[PivotCon$bbTemp=="293bb" &
+         PivotCon$Measurement=="Emiss",]
+```
+
+```{r}
+ggplot(PivotCon[PivotCon$bbTemp=="343bb",], 
+       aes(x = factor(spp, levels =pospos),
+           y = ElyResponse, fill = Measurement)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(x = "Species", y = "Value", fill = "Variable") +
+  scale_fill_manual(values=c( "#FFA500", "#9ACD32", "#4682B4"))+
+  coord_flip()+
+  geom_hline(yintercept = 0.91, lty=2)+
+  theme_minimal()
+
+PivotCon[PivotCon$bbTemp=="343bb" &
+         PivotCon$Measurement=="Emiss",]
+```
+
