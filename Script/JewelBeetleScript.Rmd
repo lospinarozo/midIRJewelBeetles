@@ -1204,6 +1204,7 @@ ggplot(PivotSun[PivotSun$spot=="darkpt",],
 
 ```
 
+
 ### What wavlenegths?
 
 
@@ -1310,6 +1311,13 @@ ggplot(PivotBands[PivotBands$spot=="bright",],
 
 ```
 
+### Export data frame
+
+```{r}
+write.csv(PivotSun, here::here("Output/DataFrames/NIRVISOpticalProperties.csv"))
+```
+
+
 ## midIR
 
 ```{r}
@@ -1327,9 +1335,12 @@ PivotCon <- Consolidated %>%
   gather(Measurement, ElyResponse, -spp, -bbTemp)
 
 unique(PivotCon$bbTemp)
+
 ```
 
-PLots
+
+
+Plots
 
 293K
 ```{r}
@@ -1363,5 +1374,11 @@ ggplot(PivotCon[PivotCon$bbTemp=="343bb",],
 
 PivotCon[PivotCon$bbTemp=="343bb" &
          PivotCon$Measurement=="Emiss",]
+```
+
+### Export data frame
+
+```{r}
+write.csv(PivotCon, here::here("Output/DataFrames/midIRproperties.csv"))
 ```
 
